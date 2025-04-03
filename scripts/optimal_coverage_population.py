@@ -1,19 +1,21 @@
 #!/usr/bin/env python
 
 """
-Script to calculate the coverage of the nursing charts with respect to the monitoring data using dynamic programming.
+Script to calculate the coverage of the nursing charts with respect to the monitoring data using population methods
 
-Example: 
+Example:
 
-python -u /deep/u/tomjin/optimizing-vital-signs/scripts/optimal_coverage.py -i /deep/group/physiologic-states/v3/coverage_2022_02_17.charted.csv -o /deep/group/physiologic-states/v3/optimizing_coverage.optimal.csv -l /deep/group/physiologic-states/v3/optimizing_coverage.optimal.pkl -m t -r /deep/group/physiologic-states/v3/csv -c HR,RR,SpO2,MAP -p 10
+python -u /deep/u/tomjin/optimizing-vital-signs/scripts/optimal_coverage_population.py -i /deep/group/physiologic-states/v3/coverage_2022_02_17.charted.csv -o /deep/group/physiologic-states/v3/optimizing_coverage_population.optimal.csv -l /deep/group/physiologic-states/v3/optimizing_coverage_population.optimal.pkl -m t -r /deep/group/physiologic-states/v3/csv -c HR,RR,SpO2,MAP -p 10
 
 """
 
 import argparse
 import csv
 import datetime
+import traceback
 from concurrent import futures
 
+import operator
 import numpy as np
 import pandas as pd
 import pytz
@@ -30,11 +32,16 @@ BOUNDS = {
     "MAP": 6
 }
 
+TRUNCATION_TOP_K = 10
+MUTATION_RATE = 0.05
+MUTATION_MAX_SHIFT_MINUTES = 5
+
 
 # Note: coverage defined by three fields:
 # (start index, end index) => (simulated nurse measure, num waveform elements during this range, num waveform elements covered)
 # (0, 10) => [110, 4, 2] # if there are values in this range
 # (0, 10) => [] # if there are no values in this range
+
 
 def generate_coverage(cols, col_to_data, min_time, max_time):
     start_end_to_coverage = {}
@@ -81,143 +88,91 @@ def generate_coverage(cols, col_to_data, min_time, max_time):
     return start_end_to_coverage
 
 
-def find_optimal_coverage(orig_num_resources_left, col_to_data, min_time, max_time, cols, silent=False):
-    visited = {}
+def generate_individual(max_index, max_charted_events):
+    indices = list(range(max_index))
+    return np.random.choice(indices, size=max_charted_events, replace=False)
 
-    def get_simulated_nurse_helper(start_end_to_coverage, min_time, start_time, simulated_nurse_vals,
-                                   num_resources_left):
 
-        start_min = int((start_time - min_time).total_seconds() / 60.0)
-        if (start_min, num_resources_left) in visited:
-            return visited[(start_min, num_resources_left)]
+def initialize_population(max_individuals, col_to_data, cols, max_charted_events):
+    max_index = 0
+    for c in cols:
+        waveform_times = col_to_data[cols[0]]["waveform_times"]
+        if len(waveform_times) > max_index:
+            max_index = len(waveform_times)
 
-        if num_resources_left == 0:
-            # No more nurse resources, just give the remaining waveform vals to the last known nurse val
-            covered = 0
-            total = 0
-            for col_idx, col in enumerate(cols):
-                bound = BOUNDS[col]
-                waveform_times = col_to_data[col]["waveform_times"]
-                waveform_vals = col_to_data[col]["waveform_vital_signs"]
-                waveform_vals = waveform_vals[waveform_times > start_time]
-                for val in waveform_vals:
-                    if simulated_nurse_vals[col_idx] != float("nan"):
-                        if (simulated_nurse_vals[col_idx] - bound) <= val <= (simulated_nurse_vals[col_idx] + bound):
-                            covered += 1
-                    total += 1
+    population = []
+    for i in range(max_individuals):
+        population.append(generate_individual(max_index, max_charted_events))
+    return population
 
-                if (start_min, num_resources_left) not in visited:
-                    visited[(start_min, num_resources_left)] = [[], [], 0, 0]
-                visited[(start_min, num_resources_left)][2] += total
-                visited[(start_min, num_resources_left)][3] += covered
-            return [], [], visited[(start_min, num_resources_left)][2], visited[(start_min, num_resources_left)][3]
 
-        best_coverage = 0
-        best_nurse_times = []
-        best_nurse_vals = []
-        best_total = 0
-        best_covered = 0
-        best_coverage_params = None
-        curr_min = int((start_time - min_time).total_seconds() / 60.0)
-        curr_time = start_time
-        while curr_time < max_time:
-            #         if start_idx == 0:
-            #             print(f"Working on ({start_idx}, {i})")
-            if (start_min, curr_min) not in start_end_to_coverage:
-                curr_time += datetime.timedelta(seconds=60)
-                curr_min += 1
+def select(population, waveform_times, ):
+    return
 
-            coverage_params = start_end_to_coverage[(start_min, curr_min)]
-            simulated_nurse_vals = coverage_params[0]
-            total_in_window = coverage_params[1]
-            covered_in_window = coverage_params[2]
 
-            # Also consider how the performance is if we just take the current simulated_nurse_val
-            # and use no more further nurse resources
-            max_min = int((max_time - min_time).total_seconds() / 60.0)
-            coverage_params_to_end = start_end_to_coverage[(start_min, max_min)]
-            total_in_window_to_end = coverage_params_to_end[1]
-            covered_in_window_to_end = coverage_params_to_end[2]
+def crossover(parents, population_size):
+    children = []
+    for i in range(population_size):
+        # Pick two parents at random
+        p1 = parents[np.random.choice(range(len(parents)))]
+        p2 = parents[np.random.choice(range(len(parents)))]
+        crossover_point = np.random.randint(0, len(p1))
+        child = np.concatenate((p1[:crossover_point], p2[crossover_point:]))
+        children.append(child)
+    return children
 
-            nt, nv, total_ret, covered_ret = get_simulated_nurse_helper(start_end_to_coverage, min_time, curr_time,
-                                                                        simulated_nurse_vals,
-                                                                        num_resources_left - 1)
 
-            nt_so_far = [start_time]
-            nv_so_far = [simulated_nurse_vals]
-            nt_so_far.extend(nt)
-            nv_so_far.extend(nv)
+def mutate(children):
+    mutated_children = []
+    for child in children:
+        if np.random.rand() >= MUTATION_RATE:
+            # Don't mutate in this case
+            mutated_children.append(child)
+        else:
+            random_index = np.random.choice(list(range(len(child))))
+            random_shift_min = np.random.randint(-MUTATION_MAX_SHIFT_MINUTES, MUTATION_MAX_SHIFT_MINUTES + 1)
+            child[random_index] = max(child[random_index] + random_shift_min, 0)
+            # Sort the list in case the mutation caused ordering to change
+            child = sorted(child)
+            mutated_children.append(child)
+    return mutated_children
 
-            total = total_in_window + total_ret
-            covered = covered_in_window + covered_ret
-            curr_coverage = covered / total
-            if curr_coverage >= best_coverage:
-                best_coverage = curr_coverage
-                best_nurse_times = nt_so_far
-                best_nurse_vals = nv_so_far
-                best_total = total
-                best_covered = covered
-                best_coverage_params = ((start_min, curr_min), coverage_params)
 
-            # Could taking fewer number of resources also work?
-            total_to_end = total_in_window_to_end
-            covered_to_end = covered_in_window_to_end
-            if total_to_end > 0:
-                curr_coverage_to_end = covered_to_end / total_to_end
-                # Note the equals because we want to prefer fewer resources if possible
-                if curr_coverage_to_end >= best_coverage:
-                    best_coverage = curr_coverage_to_end
-                    best_nurse_times = [start_time]
-                    best_nurse_vals = [simulated_nurse_vals]
-                    best_total = total_in_window_to_end
-                    best_covered = covered_in_window_to_end
-                    best_coverage_params = ((start_min, curr_min), coverage_params)
+def get_population_coverages(population, col_to_data, cols):
+    coverages = []
+    for individual_indices in population:
+        covered = 0
+        total = 0
+        for col_idx, col in enumerate(cols):
+            bound = BOUNDS[col]
+            waveform_times = col_to_data[col]["waveform_times"]
+            waveform_vals = col_to_data[col]["waveform_vital_signs"]
 
-            curr_time += datetime.timedelta(seconds=60)
-            curr_min += 1
+            individual_indices = individual_indices[individual_indices < len(waveform_times)]
+            simulated_times = waveform_times[individual_indices]
+            simulated_vals = waveform_vals[individual_indices]
+            covered_count, total_count, _, _ = coverage_fraction_step(waveform_times, waveform_vals, simulated_times,
+                                                                      simulated_vals, bound=bound)
+            if covered_count is not None and total_count is not None:
+                covered += covered_count
+                total += total_count
 
-        visited[(start_min, num_resources_left)] = [best_nurse_times, best_nurse_vals, best_total, best_covered]
-        # if num_resources_left == orig_num_resources_left:
-        #     print(num_resources_left, best_coverage_params)
-        #     print(best_nurse_times)
-        return best_nurse_times, best_nurse_vals, best_total, best_covered
+        if total == 0:
+            coverages.append(0)
+        else:
+            coverages.append(covered / total)
 
-    if not silent:
-        print(f"Building Coverage Lookup")
-    start_end_to_coverage = generate_coverage(cols, col_to_data, min_time, max_time)
-    # for k in start_end_to_coverage.keys():
-    #     if k[0] <= 1:
-    #         print(k, start_end_to_coverage[k])
-    if not silent:
-        print(f"num_resources_left={orig_num_resources_left}")
-        print(f"Simulating Nurse...")
-    nurse_times, nurse_vital_signs, best_total, best_covered = get_simulated_nurse_helper(start_end_to_coverage,
-                                                                                          min_time=min_time,
-                                                                                          start_time=min_time,
-                                                                                          simulated_nurse_vals=None,
-                                                                num_resources_left=orig_num_resources_left)
-
-    coverage = best_covered / best_total
-    # if not silent:
-    # print("===")
-    # print(f"Coverage Fraction = {coverage}")
-    # print(f"Covered = {best_covered}")
-    # print(f"Total = {best_total}")
-    # print(f"len(nurse_times) = {len(nurse_times)}")
-    # print(f"nurse_times = {len(nurse_times)}")
-    # print(f"nurse_vital_signs = {len(nurse_vital_signs)}")
-    # print("===")
-
-    if silent:
-        return best_covered, best_total, nurse_times, nurse_vital_signs
+    return coverages
 
 
 def get_coverage(input):
-    i, total_rows, df, csn, interpolate, root_folder, cols = input
+    i, total_rows, df, csn, interpolate, root_folder, cols, population_size, max_iterations = input
     print(f"Working on {i}/{total_rows} for CSN={csn}...")
     fn_start = datetime.datetime.now()
 
     row = [csn]
+
+    np.random.seed(i)
 
     try:
         b = get_raw_data(csn, root_folder, cols)
@@ -254,7 +209,7 @@ def get_coverage(input):
             }
 
             orig_covered, orig_total, _, _ = coverage_fraction_step(waveform_times, waveform_vital_signs, nurse_times,
-                                                         nurse_vital_signs, bound=bound)
+                                                                    nurse_vital_signs, bound=bound)
             orig_coverage = orig_covered / orig_total
             orig_coverages.append(orig_coverage)
             orig_covereds.append(orig_covered)
@@ -266,38 +221,63 @@ def get_coverage(input):
                 max_time = max(waveform_times)
             max_time = max(max_time, max(waveform_times))
 
-        best_covered, best_total, best_nurse_times, best_nurse_vital_signs = find_optimal_coverage(num_resources,
-                                                                                                   col_to_data,
-                                                                                                   min_time=min_time,
-                                                                                                   max_time=max_time,
-                                                                                                   cols=cols,
-                                                                                                   silent=True)
-#         print(best_nurse_times)
-#         print(best_nurse_vital_signs)
+        population = initialize_population(population_size, col_to_data, cols, num_resources)
+
+        iter = 0
+        while iter < max_iterations:
+            # Calculate coverage for the current population
+            #
+            coverages = get_population_coverages(population, col_to_data, cols)
+
+            # Select for the fittest individuals (with highest coverage)
+            fittest_indices = np.argpartition(coverages, -TRUNCATION_TOP_K)[-TRUNCATION_TOP_K:]
+            # print(f"Coverage in iter {iter} is {np.max(coverages)}")
+            parents = operator.itemgetter(*fittest_indices)(population)
+            children = crossover(parents, population_size)
+            children = mutate(children)
+            population = np.array(children)
+
+            iter += 1
+
+        coverages = get_population_coverages(population, col_to_data, cols)
+        best_individual_index = np.argmax(coverages)
+        best_coverage = coverages[best_individual_index]
+        best_individual = population[best_individual_index]
+        best_times = col_to_data[cols[0]]["waveform_times"][best_individual]
+
         simulated_covered = []
         simulated_total = []
         for col_idx, col in enumerate(cols):
             bound = BOUNDS[col]
             waveform_times = col_to_data[col]["waveform_times"]
             waveform_vals = col_to_data[col]["waveform_vital_signs"]
-            simulated_vals = np.array(best_nurse_vital_signs)[:, col_idx]
-            covered_count, total_count, _, _ = coverage_fraction_step(waveform_times, waveform_vals, best_nurse_times,
+            simulated_times = waveform_times[best_individual[best_individual < len(waveform_times)]]
+            simulated_vals = waveform_vals[best_individual[best_individual < len(waveform_times)]]
+            covered_count, total_count, _, _ = coverage_fraction_step(waveform_times, waveform_vals, simulated_times,
                                                                       simulated_vals, bound=bound)
-            simulated_covered.append(covered_count)
-            simulated_total.append(total_count)
+            if covered_count is not None and total_count is not None:
+                simulated_covered.append(covered_count)
+                simulated_total.append(total_count)
+            else:
+                simulated_covered.append(0)
+                simulated_total.append(0)
 
-        row.extend([num_resources, np.sum(orig_covereds), np.sum(orig_totals), np.sum(orig_covereds) / np.sum(orig_totals), len(best_nurse_times), best_covered, best_total, best_covered / best_total])
+        row.extend(
+            [num_resources, np.sum(orig_covereds), np.sum(orig_totals), np.sum(orig_covereds) / np.sum(orig_totals),
+             len(best_individual), sum(simulated_covered), sum(simulated_total), sum(simulated_covered) / sum(simulated_total) if sum(simulated_total) > 0 else 0])
         for col_idx, col in enumerate(cols):
             row.append(simulated_covered[col_idx])
             row.append(simulated_total[col_idx])
-        
+
         fn_end = datetime.datetime.now()
         row.append((fn_end - fn_start).total_seconds())
-        return row, best_nurse_times, best_nurse_vital_signs
+        return row, best_times
     except Exception as e:
+        print(f"CSN {csn} had an error")
         print(e)
-        return None, None, None
-        # raise e
+        print(traceback.format_exc())
+        return None, None
+#         raise e
 
 
 def run(args):
@@ -308,6 +288,8 @@ def run(args):
     root_folder = args.patient_folder
     interpolate = args.interpolate_missing == "t"
     cols = args.columns.split(",")
+    max_iterations = int(args.max_iterations)
+    population_size = int(args.population_size)
     max_patients = int(args.max_patients) if args.max_patients is not None else None
 
     df = pd.read_csv(input_file)
@@ -319,7 +301,7 @@ def run(args):
     fs = []
     with futures.ProcessPoolExecutor(16) as executor:
         for i, csn in tqdm(enumerate(csns), disable=True):
-            input_args = [i, total_rows, df, csn, interpolate, root_folder, cols]
+            input_args = [i, total_rows, df, csn, interpolate, root_folder, cols, population_size, max_iterations]
             future = executor.submit(get_coverage, input_args)
             fs.append(future)
             if max_patients is not None and i >= (max_patients - 1):
@@ -330,7 +312,9 @@ def run(args):
         writer = csv.writer(csv_file, delimiter=',')
 
         header = ["CSN"]
-        header.extend([f"orig_len", f"orig_covered", f"orig_total", f"orig_coverage", f"best_len", f"best_covered", f"best_total", f"best_coverage"])
+        header.extend(
+            [f"orig_len", f"orig_covered", f"orig_total", f"orig_coverage", f"best_len", f"best_covered", f"best_total",
+             f"best_coverage"])
         for col_idx, col in enumerate(cols):
             header.append(f"{col}_covered")
             header.append(f"{col}_total")
@@ -339,7 +323,7 @@ def run(args):
         for future in futures.as_completed(fs):
             # Blocking call - wait for 1 hour for a single future to complete
             # (highly unlikely, most likely something is wrong)
-            row, times_list, _ = future.result(timeout=60 * 60)
+            row, times_list = future.result(timeout=60 * 60)
             if row is not None:
                 output_times.append(times_list)
                 writer.writerow(row)
@@ -396,6 +380,16 @@ if __name__ == '__main__':
                         default="HR,RR,SpO2,MAP",
                         help='''
                             Sets the modalities to retrieve as a comma separated list - note each modality is treated equally.'
+                        ''')
+    parser.add_argument('-s', '--population-size',
+                        default=50,
+                        help='''
+                            Sets the number of individuals to use in the population based method.'
+                        ''')
+    parser.add_argument('-t', '--max-iterations',
+                        default=20,
+                        help='''
+                            Sets the maximum number of iterations.'
                         ''')
     parser.add_argument('-p', '--max-patients',
                         default=None,
